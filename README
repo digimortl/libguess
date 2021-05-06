@@ -1,0 +1,42 @@
+*Description*
+
+This is the CUDA miner extension (DLL + embeded code) for the Bitcoin Core https://github.com/bitcoin/bitcoin.git.
+Under the hood minig threads are started for each CUDA compliant graphics
+cards, and a hash is being guessed for each new block. The extension was
+developed and tested for 0.21.0 version of Bitcoin Core. Not sure if it works
+with new releases, it is not maintained any more.
+
+Honestly, I did not managed to mine any single block because I am not lucky
+to have powerful GPUs, and hashes are too complex now to guess them at home.
+Only for the academical purpose this code can be used. But who knows, may be
+You will be the lucky!
+
+*Requirements*
+
+- Microsoft Windows 10+
+- Microsoft Visual Studio 2019+
+- Nvidia graphics cards with CUDA Cores (the more cards, the better)
+- CUDA Toolkit X.Y (where X.Y last release). Download https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=10&target_type=exe_local
+
+
+*How to compile and run*
+
+D:\> git clone https://github.com/bitcoin/bitcoin.git
+D:\> cd bitcoin
+D:\bitcoin> git checkout v0.21.0
+# Configure MSVS and make sure that the project is compiled. See https://github.com/bitcoin/bitcoin/blob/master/build_msvc/README.md
+
+# Apply patches (created by `git format-patch -3 HEAD')
+D:\bitcoin> git apply --stat ..\libguess\v0.21.0\0001-Add-includeTransactions-parameter.patch
+D:\bitcoin> git apply --stat ..\libguess\v0.21.0\0002-Add-libguess-project.patch
+D:\bitcoin> git apply --stat ..\libguess\v0.21.0\0003-Embed-libguess-miner.patch
+# Complile again
+
+Create wallet and start bitcoind daemon (with the following extra options if necessary):
+
+  coinbaseonly  Always create coinbase block (default false)
+  disableminer  Disable CUDA miner at all (default false)
+  testminer     Run the self-test before start the mining threads.(default false).
+
+Check the debug.log to see the progress.
+ 

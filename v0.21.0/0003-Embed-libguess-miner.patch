@@ -1,0 +1,603 @@
+From e32f16809f34d25788a12d7d37f1f54784fda2e2 Mon Sep 17 00:00:00 2001
+From: Digi Mortl <digimortl@gmail.com>
+Date: Tue, 4 May 2021 13:06:12 +0300
+Subject: [PATCH 3/3] Embed libguess miner
+
+---
+ .gitignore                  |   3 +
+ build_msvc/bitcoin_config.h |   3 +
+ src/init.cpp                |  10 +-
+ src/miner.cpp               | 382 ++++++++++++++++++++++++++++++++++++
+ src/miner.h                 |  58 ++++++
+ src/rpc/mining.cpp          |  25 ++-
+ 6 files changed, 479 insertions(+), 2 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 5726b1892..8df76df24 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -148,3 +148,6 @@ db4/
+ osx_volname
+ dist/
+ *.background.tiff
++
++.vs/
++x64/
+diff --git a/build_msvc/bitcoin_config.h b/build_msvc/bitcoin_config.h
+index 60661f121..a70891b65 100644
+--- a/build_msvc/bitcoin_config.h
++++ b/build_msvc/bitcoin_config.h
+@@ -302,6 +302,9 @@
+    default state */
+ //#define USE_UPNP 0
+ 
++/* Define if mining support should be compiled in */
++#define USE_MINER 1
++
+ /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
+    significant byte first (like Motorola and SPARC, unlike Intel). */
+ #if defined AC_APPLE_UNIVERSAL_BUILD
+diff --git a/src/init.cpp b/src/init.cpp
+index 6380da4f7..8575f4117 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -161,6 +161,7 @@ static boost::thread_group threadGroup;
+ 
+ void Interrupt(NodeContext& node)
+ {
++    InterruptMiner();
+     InterruptHTTPServer();
+     InterruptHTTPRPC();
+     InterruptRPC();
+@@ -190,6 +191,7 @@ void Shutdown(NodeContext& node)
+     util::ThreadRename("shutoff");
+     if (node.mempool) node.mempool->AddTransactionsUpdated(1);
+ 
++    StopMiner();
+     StopHTTPRPC();
+     StopREST();
+     StopRPC();
+@@ -586,7 +588,9 @@ void SetupServerArgs(NodeContext& node)
+ #else
+     hidden_args.emplace_back("-daemon");
+ #endif
+-
++    hidden_args.emplace_back("-disableminer");
++    hidden_args.emplace_back("-testminer");
++    hidden_args.emplace_back("-coinbaseonly");
+     // Add the hidden options
+     argsman.AddHiddenArgs(hidden_args);
+ }
+@@ -2023,5 +2027,9 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
+     StartupNotify(args);
+ #endif
+ 
++    if (!args.GetBoolArg("-disableminer", false)) {
++        StartMiner(chainman, *node.mempool, args.GetBoolArg("-coinbaseonly", false), args.GetBoolArg("-testminer", false));
++    }
++
+     return true;
+ }
+diff --git a/src/miner.cpp b/src/miner.cpp
+index 855a1ea26..7cc997bb6 100644
+--- a/src/miner.cpp
++++ b/src/miner.cpp
+@@ -13,13 +13,26 @@
+ #include <consensus/merkle.h>
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
++
++#ifdef USE_MINER
++#include <guess.h>
++#endif
++
++#include <key_io.h>
+ #include <policy/feerate.h>
+ #include <policy/policy.h>
+ #include <pow.h>
+ #include <primitives/transaction.h>
+ #include <timedata.h>
++#include <threadinterrupt.h>
++#include <serialize.h>
++#include <shutdown.h>
++#include <streams.h>
+ #include <util/moneystr.h>
+ #include <util/system.h>
++#include <validation.h>
++#include <version.h>
++#include <wallet/wallet.h>
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -456,3 +469,372 @@ void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned
+     pblock->vtx[0] = MakeTransactionRef(std::move(txCoinbase));
+     pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
+ }
++
++
++
++
++
++
++
++#ifdef USE_MINER
++static CThreadInterrupt g_miner_interrupt;
++static std::vector<std::thread> g_miner_threads;
++static RecursiveMutex cs_mining_state;
++static MiningState g_mining_state{};
++
++const MiningState& GetMiningState()
++{
++    return g_mining_state;
++}
++
++static arith_uint256 bytesToArith256(const unsigned char pch[HASH_SIZE])
++{
++    uint256 hash;
++    memcpy(hash.data(), pch, hash.size());
++    return UintToArith256(hash);
++}
++
++static bool getNewAddress(CTxDestination& dest)
++{
++    std::vector<std::shared_ptr<CWallet>> wallets = GetWallets();
++
++    if (wallets.empty()) {
++        LogPrintf("miner: No wallet is loaded.\n");
++        return false;
++    }
++
++    if (wallets.size() != 1) {
++        LogPrintf("miner: Error: Too many wallets.\n");
++        return false;
++    }
++
++    std::shared_ptr<CWallet> const wallet = wallets[0];   
++    CWallet* const pwallet = wallet.get();
++
++    LOCK(pwallet->cs_wallet);
++
++    if (!pwallet->CanGetAddresses()) {
++        LogPrintf("miner: Error: This wallet has no available keys.");
++        return false;
++    }
++
++    std::string error;
++    if (!pwallet->GetNewDestination(pwallet->m_default_address_type, std::string(), dest, error)) {
++        LogPrintf("miner: Error: %s\n", error);
++        return false;
++    }
++
++    return true;
++}
++
++static std::vector<std::shared_ptr<const DeviceProp>> listDevices()
++{
++    DeviceProp* deviceProps = nullptr;
++    int deviceCount;
++    int errorCode;
++
++    std::vector<std::shared_ptr<const DeviceProp>> vDevProps;
++
++    errorCode = ListDevices(&deviceProps, &deviceCount);
++    if (errorCode) {
++        LogPrintf("miner: Error: %s\n", GetErrorString(errorCode));
++        if (deviceProps)
++            delete deviceProps;
++
++        return vDevProps;
++    }
++
++    for (auto device = 0; device < deviceCount; device++)
++        vDevProps.push_back(std::make_shared<const DeviceProp>(deviceProps[device]));
++
++    delete deviceProps;
++
++    return vDevProps;
++}
++
++static bool generateBlock(const DeviceProp& deviceProp, CBlock& block)
++{   
++    int64_t nTimeStart = GetTimeMicros();
++
++    arith_uint256 bnTarget;
++    bool fNegative, fOverflow;
++    
++    bnTarget.SetCompact(block.nBits, &fNegative, &fOverflow);
++    
++    // Check range
++    if (fNegative || bnTarget == 0 || fOverflow || bnTarget > UintToArith256(Params().GetConsensus().powLimit)) {
++        LogPrintf("miner: Incorrect target range.\n");
++        return false;
++    }
++
++    CDataStream ssBlockHeader(SER_NETWORK, PROTOCOL_VERSION);
++    ssBlockHeader << block.GetBlockHeader();
++
++    GuessResult guessResult;
++    int errorCode = RunGuess((unsigned char*)ssBlockHeader.data(), ArithToUint256(bnTarget).data(), deviceProp.multiprocessors, guessResult);
++    if (errorCode) {
++        LogPrintf("miner: Error: %s\n", GetErrorString(errorCode));
++        return false;
++    }
++
++    int64_t nTime1 = GetTimeMicros();
++    arith_uint256 bestHash = bytesToArith256(guessResult.bestHash);
++
++    WITH_LOCK(cs_mining_state, g_mining_state.UpdateMiningState(bnTarget, bestHash, nTime1 - nTimeStart));
++   
++    if (!guessResult.bGuessed)
++        return false;
++
++    block.nTime = guessResult.bestTime;
++    block.nNonce = guessResult.bestNonce;
++
++    // Check proof of work matches claimed amount
++    if (UintToArith256(block.GetHash()) > bnTarget) {
++        LogPrintf("miner: Wrong best hash, guess kernel is buggy.\n");
++        return false;
++    }
++
++    int64_t nTime2 = GetTimeMicros();
++    LogPrintf("miner: Guessed\n"
++              "target    %s\n"
++              "hash      %s\n"
++              "elapsed   %.2fs (total %.2fs)\n",
++              g_mining_state.target.ToString().c_str(),
++              block.GetHash().ToString().c_str(),
++              0.000001 * (nTime1 - nTimeStart), 0.000001 * (nTime2 - nTimeStart));
++
++    return true;
++}
++
++static void testBlockValidity(const CBlock& block, int nTimes = 6)
++{
++    static int nTestedTimes{0};
++
++    if (nTestedTimes <= nTimes) {
++        LOCK(cs_main);
++        BlockValidationState state;
++        if (!TestBlockValidity(state, Params(), block, LookupBlockIndex(block.hashPrevBlock), false, true)) {
++            throw std::runtime_error(strprintf("testBlockValidity failed: %s", state.ToString()));
++        }
++        LogPrintf("miner: Valid block.\n");
++
++        nTestedTimes++;
++    }
++}
++
++static bool waitTillWarmedUp(double verificationProgessThreshold)
++{
++    do {
++        {
++            LOCK(cs_main);
++
++            if (!::ChainstateActive().IsInitialBlockDownload()) {
++                if (GuessVerificationProgress(Params().TxData(), ::ChainActive().Tip()) > verificationProgessThreshold)
++                    return true;
++            }
++        }
++    } while (g_miner_interrupt.sleep_for(std::chrono::seconds(5)) && !ShutdownRequested());
++
++    return false;
++}
++
++static bool selfTest(const DeviceProp& deviceProp)
++{
++    WITH_LOCK(cs_mining_state, g_mining_state.Reset());
++
++    const MapCheckpoints& checkpoints = Params().Checkpoints().mapCheckpoints;
++
++    LogPrintf("selfTest: Checkpoints test started.\n");
++    int nCompleted = 0;
++    for (const MapCheckpoints::value_type& i : checkpoints) {
++
++        if (!g_miner_interrupt.sleep_for(std::chrono::milliseconds(1)) || ShutdownRequested()) {
++            return false;
++        }
++
++        CBlockIndex* pblockindex = WITH_LOCK(cs_main, return LookupBlockIndex(i.second));
++        if (!pblockindex) {
++            LogPrintf("selfTest: Block %d -> %s not found.\n", i.first, i.second.GetHex());
++            return false;
++        }
++
++        if (IsBlockPruned(pblockindex)) {
++            LogPrintf("selfTest: Block not available (pruned data).\n");
++            return false;
++        }
++
++        CBlock block;
++        if (!ReadBlockFromDisk(block, pblockindex, Params().GetConsensus())) {
++            LogPrintf("selfTest: Block not found on disk.\n");
++            return false;
++        }
++        CBlockHeader origHeader = block.GetBlockHeader();
++
++        LogPrintf("selfTest: Multiproccessors %d.\n", deviceProp.multiprocessors);
++
++        block.nNonce = 0;        
++        if (!generateBlock(deviceProp, block)) {
++            LogPrintf("selfTest: Not hash guessed for bock %d -> %s.\n", i.first, i.second.GetHex());
++            return false;
++        }
++
++        if (origHeader.GetHash() != block.GetHash() || origHeader.nTime != block.nTime || origHeader.nNonce != block.nNonce) {
++            LogPrintf("selfTest: Incorrect hash of block %d -> %s.\n", i.first, i.second.GetHex());
++            return false;
++        }
++
++        nCompleted++;
++        LogPrintf("selfTest: [% 3d%%] Passed height %d hash %s.\n", 100*nCompleted/checkpoints.size(), i.first, i.second.GetHex());
++    }
++
++    return true;
++}
++
++static void startMinerLoop(const DeviceProp& deviceProp, ChainstateManager& chainman, const CTxMemPool& mempool, bool coinbaseOnly)
++{             
++    WITH_LOCK(cs_mining_state, g_mining_state.Reset());
++
++    CTxDestination dest;
++
++    if (!getNewAddress(dest))
++        return;
++
++    LogPrintf("miner: Start with new address %s.\n", EncodeDestination(dest).c_str());
++
++    std::unique_ptr<CBlockTemplate> pblocktemplate;
++    CBlockIndex* pindexPrev{nullptr};
++    int64_t nStart{0};
++    unsigned int nTransactionsUpdatedLast{0};
++
++    while (g_miner_interrupt.sleep_for(std::chrono::milliseconds(1)) && !ShutdownRequested()) {
++        {
++            LOCK(cs_main);
++            
++            if (pindexPrev != ::ChainActive().Tip() ||
++                (!coinbaseOnly && mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 5)) {
++                // Clear pindexPrev so future calls make a new block, despite any failures from here on
++                pindexPrev = nullptr;
++
++                // Store the pindexBest used before CreateNewBlock, to avoid races
++                nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
++                CBlockIndex* pindexPrevNew = ::ChainActive().Tip();                
++                nStart = GetTime();
++
++                // Create new block
++                CScript coinbaseScript = GetScriptForDestination(dest);
++                pblocktemplate = BlockAssembler(mempool, Params()).CreateNewBlock(coinbaseScript, !coinbaseOnly);
++                if (!pblocktemplate)
++                    throw std::runtime_error("Out of memory");
++
++                pblocktemplate->block.hashMerkleRoot = BlockMerkleRoot(pblocktemplate->block);
++
++                // Need to update only after we know CreateNewBlock succeeded
++                pindexPrev = pindexPrevNew;
++            }
++        }
++        CBlock* pblock = &pblocktemplate->block; // pointer for convenience
++        const Consensus::Params& consensusParams = Params().GetConsensus();
++
++        // Update nTime
++        UpdateTime(pblock, consensusParams, pindexPrev);
++        pblock->nNonce = 0;
++
++        // Debug
++        testBlockValidity(*pblock);
++
++        if (!generateBlock(deviceProp, *pblock))
++            continue;
++
++        std::shared_ptr<const CBlock> sharedBblock = std::make_shared<const CBlock>(*pblock);
++        if (!chainman.ProcessNewBlock(Params(), sharedBblock, true, nullptr)) {
++            LogPrintf("miner: ProcessNewBlock, block not accepted.\n");
++            continue;
++        }
++
++        WITH_LOCK(cs_mining_state, g_mining_state.Mined(*pblock));
++        LogPrintf("miner: Mined %s.\n", pblock->GetHash().GetHex().c_str());
++
++        if (!getNewAddress(dest)) {
++            LogPrintf("miner: Keep the same address.\n");
++        } else {
++            LogPrintf("miner: New address chose %s.\n", EncodeDestination(dest).c_str());
++        }
++
++    }
++}
++
++void StartMiner(ChainstateManager& chainman, const CTxMemPool& mempool, bool coinbaseOnly, bool selfTesting)
++{
++    std::vector<std::shared_ptr<const DeviceProp>> deviceProps = listDevices();
++
++    if (deviceProps.size() == 0) {
++        LogPrintf("miner: No devices.\n");
++        return;
++    }
++
++    if (g_miner_threads.size() > 0) {
++        LogPrintf("miner: Miner thread are already run.\n");
++        return;
++    }
++
++    assert(!g_miner_interrupt);
++
++    for (const auto& deviceProp : deviceProps) {
++        auto minerThread = std::thread(&TraceThread<std::function<void()>>, "miner", [=, &chainman, &mempool]() {
++
++            int errorCode = SelectDevice(deviceProp->device);
++            if (errorCode) {
++                LogPrintf("miner: Error: %s\n", GetErrorString(errorCode));
++                return;
++            }
++
++            LogPrintf("miner: Device#%d selected.\n", deviceProp->device);
++
++            if (!waitTillWarmedUp(selfTesting ? 0.9999/*9*/ : 0.99999/*9*/))
++                return;
++
++            if (selfTesting && !selfTest(*deviceProp))
++                return;
++
++            startMinerLoop(*deviceProp, chainman, mempool, coinbaseOnly);   
++
++            LogPrintf("miner: Device#%d freed.\n", deviceProp->device);
++        });
++        g_miner_threads.push_back(std::move(minerThread));
++    }
++}
++
++void InterruptMiner()
++{
++    for (const auto& minerThread : g_miner_threads) {
++        if (minerThread.joinable()) {
++            g_miner_interrupt();
++        }
++    }
++}
++
++void StopMiner()
++{
++    for (auto& minerThread : g_miner_threads) {
++        if (minerThread.joinable()) {
++            minerThread.join();
++            g_miner_interrupt.reset();
++        }
++    }
++}
++#else
++void StartMiner(ChainstateManager& chainman, const CTxMemPool& mempool, bool coinbaseOnly, bool selfTesting)
++{
++    // Intentionally left blank.
++}
++
++void InterruptMiner()
++{
++    // Intentionally left blank.
++}
++
++void StopMiner()
++{
++    // Intentionally left blank.
++}
++#endif
+\ No newline at end of file
+diff --git a/src/miner.h b/src/miner.h
+index 9a06d5043..8e2fff447 100644
+--- a/src/miner.h
++++ b/src/miner.h
+@@ -204,4 +204,62 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
+ /** Update an old GenerateCoinbaseCommitment from CreateNewBlock after the block txs have changed */
+ void RegenerateCommitments(CBlock& block);
+ 
++void StartMiner(ChainstateManager& chainman, const CTxMemPool& mempool, bool coinbaseOnly = false, bool selfTesting = false);
++void InterruptMiner();
++void StopMiner();
++
++struct MiningState {
++    uint64_t nTries;
++    uint64_t nMinTime;
++    uint64_t nMaxTime;
++    uint64_t nTimeSum;
++    uint64_t lastEllapsedTime;
++    double AverangeTime() const { return (nTries > 0) ? 1.0 * nTimeSum / nTries : 0.0; }
++
++    arith_uint256 target;
++    arith_uint256 lastHash;
++    arith_uint256 bestHash;
++    std::vector<uint256> mindedBlockHashes;
++
++    MiningState()        
++    {   
++        Reset();
++    }
++
++    bool IsNull() const
++    {
++        return nTries == 0;
++    }
++
++    void Reset()
++    {
++        nTries = 0;
++        nMinTime = std::numeric_limits<uint64_t>::max();
++        nMaxTime = 0;
++        nTimeSum = 0;
++        target = lastHash = bestHash = arith_uint256();
++        mindedBlockHashes.clear();
++    }
++
++    void UpdateMiningState(const arith_uint256& hashTarget, const arith_uint256& hash, const uint64_t& elapsedTime)
++    {
++        target = hashTarget;
++        lastHash = hash;
++
++        if (IsNull() || lastHash < bestHash || bestHash <= target)
++            bestHash = hash;
++
++        nMinTime = std::min(nMinTime, elapsedTime);
++        nMaxTime = std::max(nMaxTime, elapsedTime);
++        nTimeSum += elapsedTime;
++        nTries += 1;
++    }
++
++    void Mined(const CBlock& block)
++    {
++        mindedBlockHashes.push_back(block.GetHash());
++    }
++};
++
++const MiningState& GetMiningState();
+ #endif // BITCOIN_MINER_H
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 6522c0d73..b32a92dd2 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -400,6 +400,19 @@ static RPCHelpMan generateblock()
+     };
+ }
+ 
++static std::string formattedHash(const std::string& hashString)
++{    
++    return strprintf("0x %s %s %s %s %s %s %s %s",
++                     hashString.substr(0, 8),
++                     hashString.substr(8, 8),
++                     hashString.substr(16, 8),
++                     hashString.substr(24, 8),
++                     hashString.substr(32, 8),
++                     hashString.substr(40, 8),
++                     hashString.substr(48, 8),
++                     hashString.substr(56, 8));
++}
++
+ static RPCHelpMan getmininginfo()
+ {
+     return RPCHelpMan{"getmininginfo",
+@@ -435,12 +448,22 @@ static RPCHelpMan getmininginfo()
+     obj.pushKV("pooledtx",         (uint64_t)mempool.size());
+     obj.pushKV("chain",            Params().NetworkIDString());
+     obj.pushKV("warnings",         GetWarnings(false).original);
++    obj.pushKV("target  ",         formattedHash(GetMiningState().target.GetHex()));
++    obj.pushKV("besthash",         formattedHash(GetMiningState().bestHash.GetHex()));
++    obj.pushKV("lasthash",         formattedHash(GetMiningState().lastHash.GetHex()));
++    obj.pushKV("maxtime ",         strprintf("%.2fs", 0.000001 * GetMiningState().nMaxTime));
++    obj.pushKV("avgtime ",         strprintf("%.2fs", 0.000001 * GetMiningState().AverangeTime()));
++    obj.pushKV("mintime ",         strprintf("%.2fs", 0.000001 * GetMiningState().nMinTime));
++    obj.pushKV("tries   ",         strprintf("%lu", GetMiningState().nTries));
++    UniValue minedArr(UniValue::VARR);
++    for (const auto& minedHash : GetMiningState().mindedBlockHashes)
++        minedArr.push_back(minedHash.GetHex());
++    obj.pushKV("mined   ",         minedArr);
+     return obj;
+ },
+     };
+ }
+ 
+-
+ // NOTE: Unlike wallet RPC (which use BTC values), mining RPCs follow GBT (BIP 22) in using satoshi amounts
+ static RPCHelpMan prioritisetransaction()
+ {
+-- 
+2.25.0.windows.1
+
